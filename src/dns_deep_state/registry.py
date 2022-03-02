@@ -1,6 +1,8 @@
 """Query domain registries about a domain name."""
-from dns_deep_state.exceptions import DomainError
 import whoisit
+import whoisit.errors
+
+from dns_deep_state.exceptions import DomainError
 
 
 class RegistryProbe:
@@ -28,12 +30,12 @@ class RegistryProbe:
         :param fqdn: The fully qualified domain name that we're querying
             information for.
 
-        :returns: A dictionary containing registration information.
+        :return: A dictionary containing registration information.
         """
         try:
             domain = whoisit.domain(fqdn)
         except whoisit.errors.ResourceDoesNotExist:
-            raise DomainError("Domain {} is not registered.".format(fqdn))
+            raise DomainError(f"Domain {fqdn} is not registered.")
         except whoisit.errors.QueryError as e:
             if any("DH_KEY_TOO_SMALL" in s for s in e.args):
                 # Let's retry with weak ssl permitted

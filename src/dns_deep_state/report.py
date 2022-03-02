@@ -15,20 +15,27 @@ Rough early specs:
     to specify an alternative configuration file.
 
 """
-import json
-from typing import Set
+from __future__ import annotations
 
+import json
+from typing import TYPE_CHECKING
+
+from dns.resolver import NoAnswer
 from publicsuffix2 import PublicSuffixList
 
 from dns_deep_state.dns import DnsProbe
 from dns_deep_state.hosts import HostsProbe
 from dns_deep_state.registry import RegistryProbe
+from dns_deep_state.exceptions import DomainError
+
+if TYPE_CHECKING:
+    from typing import Set, Dict, Union
 
 
 class DomainReport:
     """Inspect the state of a domain name and report on possible issues."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialise information probes."""
         self.psl = PublicSuffixList()
         self.reg = RegistryProbe()
@@ -67,14 +74,14 @@ class DomainReport:
         domain_name = self.psl.get_sld(fqdn, strict=True)
         if domain_name is None:
             raise ValueError(
-                "{} is not using a known public suffix or TLD".format(fqdn))
+                f"{fqdn} is not using a known public suffix or TLD")
         report["domain"] = domain_name
 
         report["registry"] = self.registry_report(fqdn)
         report["dns"] = self.dns_report(fqdn)
         # TODO extract portion of report with resolved hosts and give that to
         # the next report method instead of fqdn
-        hostnames = set([])
+        hostnames: Set[str] = set()
         report["hosts"] = self.local_hosts_report(hostnames)
 
         return json.dumps(report)
@@ -87,11 +94,16 @@ class DomainReport:
             not expired
             not in a problematic status
             the DNS hosts in the registry have glue records
+
+        :param domain_name: The domain name for which we'll be gathering
+          information into a report.
+
+        :return: A dictionary containing report information.
         """
         info = self.reg.domain_name(domain_name)
         report = {}
         report["status"] = info["status"]
-        report["expiration_date"] = info["expiration_date"]
+        report["expiration_date"] = str(info["expiration_date"])
         report["registrar"] = info["entities"]["registrar"][0]["name"]
         report["nameservers"] = info["nameservers"]
         return report
@@ -137,8 +149,41 @@ class DomainReport:
                 * hosts found in SRV records
               * it would be a good idea to have a parameter for extra hosts to
                 include in the report
+
+        :param fqdn: The domain name for which we'll gather DNS information
+          into a report.
+
+        :return: A dictionary containing report information.
         """
-        return {}
+        report = {}
+
+        try:
+            nameservers = self.dns.name_servers(fqdn)
+        except (DomainError, NoAnswer):
+            raise DomainError(
+                f"No nameserver was found for {fqdn}. Cannot go further.")
+
+        ns_data = []
+        for ns in nameservers:
+            ns_ips = self.dns.v4_address(ns)
+            if self.dns.ipv6_enabled:
+                ns_ips.extend(self.dns.v6_address(ns))
+
+            for ns_ip in ns_ips:
+                ns_struct: Dict[str, Union[str, Dict[str, str]]] = {
+                    "hostname": ns,
+                    "ip_address": ns_ip,
+                }
+                # TODO catch errors from this
+                soa = self.dns.soa(fqdn, ns_ip)
+
+                ns_struct["soa"] = soa
+
+                ns_data.append(ns_struct)
+
+        report["nameservers"] = ns_data
+
+        return report
 
     def local_hosts_report(self, hosts: Set[str]) -> dict:
         """Produce a report about the presence of hosts in the local database.

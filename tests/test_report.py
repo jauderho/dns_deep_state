@@ -6,11 +6,14 @@ using.
 
 It's also meant to be used as an CLI tool if called as a script.
 """
+import copy
 import json
+from itertools import chain
 
 import pytest
 
 from dns_deep_state.report import DomainReport
+from dns_deep_state.exceptions import DomainError
 
 from .test_hosts import hosts_file
 from .test_registry import expected_rdap_info
@@ -34,11 +37,17 @@ def domain_report_mocked_probes(mocker, probe_used=None):
         "dns": "dns_deep_state.report.DnsProbe",
         "local_hosts": "dns_deep_state.report.HostsProbe",
     }
+    if probe_used not in probes.keys():
+        raise Exception("Unknown probe {probe_used}")
 
     for name, func in probes.items():
         if name != probe_used:
             # Mock out any probe that wasn't requested for testing
             mocker.patch(func, mocker.MagicMock)
+
+    if probe_used == "dns":
+        mocker.patch('dns_deep_state.dns.DnsProbe._ipv6_connectivity',
+                     mocker.Mock(return_value=True))
 
     return DomainReport()
 
@@ -55,7 +64,7 @@ def test_full_report_known_tld(mocker):
     patch_prefix = "dns_deep_state.report"
     for name in ["registry", "dns", "local_hosts"]:
         mocker.patch(
-            "{}.DomainReport.{}_report".format(patch_prefix, name),
+            f"{patch_prefix}.DomainReport.{name}_report",
             mocker.Mock(return_value={}))
     reporter = domain_report_mocked_probes(mocker, probe_used="psl")
 
@@ -95,6 +104,54 @@ def test_registry_report(mocker):
     expctd_reg = expected_rdap_info["entities"]["registrar"][0]["name"]
     assert r["registrar"] == expctd_reg
     assert r["nameservers"] == expected_rdap_info["nameservers"]
+
+
+def test_dns_report_no_nameservers(mocker):
+    """Can't find nameservers in DNS zone."""
+    raised_exc = DomainError(
+        "No nameservers were found in DNS for example.com")
+    dns_lookup = mocker.Mock(side_effect=raised_exc)
+    mocker.patch("dns_deep_state.report.DnsProbe.name_servers", dns_lookup)
+    reporter = domain_report_mocked_probes(mocker, probe_used="dns")
+
+    with pytest.raises(DomainError):
+        reporter.dns_report("example.com")
+
+
+def test_dns_report(mocker):
+    """Get all probed DNS information as a report."""
+    reporter = domain_report_mocked_probes(mocker, probe_used="dns")
+
+    # We don't care at this level how the lookup is implemented. We only care
+    # that when certain name servers are returned we get the proper form of
+    # report.
+    name_servers = {"ns1.example.com", "ns2.example.com", "ns3.example.com"}
+    dns_lookup = mocker.Mock(return_value=name_servers)
+    reporter.dns.name_servers = dns_lookup
+    # In this scenario, all is going fine so we'll always return the same SOA
+    # structure.
+    soa_response = {"serial": "199974862"}
+    reporter.dns.soa = mocker.Mock(return_value=soa_response)
+
+    ns_v4_ips = [["127.0.0.121"], ["127.0.0.122"], ["127.0.0.123"]]
+    reporter.dns.v4_address = mocker.Mock(side_effect=copy.deepcopy(ns_v4_ips))
+    ns_v6_ips = [["fe80::a"], ["fe80::b"], ["fe80::c"]]
+    reporter.dns.v6_address = mocker.Mock(side_effect=copy.deepcopy(ns_v6_ips))
+
+    r = reporter.dns_report("example.com")
+
+    # All went well: got one IPv4 and one IPv6 for each nameserver and all
+    # responded with the same soa record information
+    assert len(r["nameservers"]) == 6
+    assert {x["hostname"] for x in r["nameservers"]} == name_servers
+
+    all_found_ns_ips = [x["ip_address"] for x in r["nameservers"]]
+    all_ips = list(chain.from_iterable(ns_v4_ips)) + list(chain.from_iterable(ns_v6_ips))
+    assert len(all_found_ns_ips) == len(all_ips)
+    assert set(all_found_ns_ips) == set(all_ips)
+
+    for ns in r["nameservers"]:
+        assert ns["soa"]["serial"] == soa_response["serial"]
 
 
 def test_local_hosts_report(mocker):
